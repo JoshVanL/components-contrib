@@ -712,7 +712,6 @@ func Test_mqttPubSub_Publish(t *testing.T) {
 			m := &mqttPubSub{
 				producer: newMockedMQTTClient(msgCh),
 				logger:   tt.fields.logger,
-				ctx:      tt.fields.ctx,
 				metadata: tt.fields.metadata,
 			}
 

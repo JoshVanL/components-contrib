@@ -200,7 +200,6 @@ func TestParseMetadata(t *testing.T) {
 
 		logger := logger.NewLogger("test")
 		m := NewMQTT(logger).(*MQTT)
-		m.ctx, m.cancel = context.WithCancel(context.Background())
 
 		m.handleMessage(context.Background(), func(ctx context.Context, r *bindings.ReadResponse) ([]byte, error) {
 			assert.Equal(t, payload, r.Data)

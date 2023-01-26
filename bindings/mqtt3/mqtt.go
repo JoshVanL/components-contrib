@@ -58,14 +58,11 @@ const (
 
 // MQTT allows sending and receiving data to/from an MQTT broker.
 type MQTT struct {
-	producer mqtt.Client
-	consumer mqtt.Client
-	metadata *metadata
-	logger   logger.Logger
-
-	ctx     context.Context
-	cancel  context.CancelFunc
-	backOff backoff.BackOff
+	producer     mqtt.Client
+	consumer     mqtt.Client
+	metadata     *metadata
+	logger       logger.Logger
+	constBackoff backoff.BackOff
 }
 
 // NewMQTT returns a new MQTT instance.
@@ -153,7 +150,7 @@ func parseMQTTMetaData(md bindings.Metadata) (*metadata, error) {
 }
 
 // Init does MQTT connection parsing.
-func (m *MQTT) Init(metadata bindings.Metadata) error {
+func (m *MQTT) Init(ctx context.Context, metadata bindings.Metadata) error {
 	mqttMeta, err := parseMQTTMetaData(metadata)
 	if err != nil {
 		return err
@@ -167,14 +164,10 @@ func (m *MQTT) Init(metadata bindings.Metadata) error {
 		return err
 	}
 
-	m.ctx, m.cancel = context.WithCancel(context.Background())
-
 	// TODO: Make the backoff configurable for constant or exponential
-	b := backoff.NewConstantBackOff(5 * time.Second)
-	m.backOff = backoff.WithContext(b, m.ctx)
+	m.constBackoff = backoff.NewConstantBackOff(5 * time.Second)
 
 	m.producer = p
-
 	m.logger.Debug("mqtt message bus initialization complete")
 
 	return nil
@@ -190,8 +183,8 @@ func (m *MQTT) Invoke(ctx context.Context, req *bindings.InvokeRequest) (*bindin
 	// a fixed 200ms interval. This is not configurable to keep this as an implementation detail
 	// for this component, as the additional public config metadata required could be replaced
 	// by the more general Dapr APIs for resiliency moving forwards.
-	cbo := backoff.NewConstantBackOff(200 * time.Millisecond)
-	bo := backoff.WithMaxRetries(cbo, 3)
+	var bo backoff.BackOff = backoff.NewConstantBackOff(200 * time.Millisecond)
+	bo = backoff.WithMaxRetries(bo, 3)
 	bo = backoff.WithContext(bo, ctx)
 
 	return nil, retry.NotifyRecover(func() error {
@@ -236,9 +229,9 @@ func (m *MQTT) handleMessage(ctx context.Context, handler bindings.Handler, mqtt
 		}
 		mqttMsg.Ack()
 		return nil
-	case <-m.ctx.Done():
-		m.logger.Infof("Read context cancelled: %v", m.ctx.Err())
-		return m.ctx.Err()
+	case <-ctx.Done():
+		m.logger.Infof("Read context cancelled: %v", ctx.Err())
+		return ctx.Err()
 	}
 }
 
@@ -260,7 +253,7 @@ func (m *MQTT) Read(ctx context.Context, handler bindings.Handler) error {
 
 	m.logger.Debugf("mqtt subscribing to topic %s", m.metadata.topic)
 	token := m.consumer.Subscribe(m.metadata.topic, m.metadata.qos, func(client mqtt.Client, mqttMsg mqtt.Message) {
-		var b backoff.BackOff = backoff.WithContext(m.backOff, ctx)
+		var b backoff.BackOff = backoff.WithContext(m.constBackoff, ctx)
 		if m.metadata.backOffMaxRetries >= 0 {
 			b = backoff.WithMaxRetries(b, uint64(m.metadata.backOffMaxRetries))
 		}
@@ -347,9 +340,6 @@ func (m *MQTT) createClientOptions(uri *url.URL, clientID string) *mqtt.ClientOp
 }
 
 func (m *MQTT) Close() error {
-	// Cancel any read callback handlers before Disconnect to prevent deadlocks.
-	m.cancel()
-
 	if m.consumer != nil {
 		m.consumer.Disconnect(5)
 	}

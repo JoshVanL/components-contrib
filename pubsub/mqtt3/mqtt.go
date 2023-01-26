@@ -44,8 +44,7 @@ type mqttPubSub struct {
 	logger          logger.Logger
 	topics          map[string]mqttPubSubSubscription
 	subscribingLock sync.RWMutex
-	ctx             context.Context
-	cancel          context.CancelFunc
+	closeCh         chan struct{}
 }
 
 type mqttPubSubSubscription struct {
@@ -59,18 +58,17 @@ func NewMQTTPubSub(logger logger.Logger) pubsub.PubSub {
 	return &mqttPubSub{
 		logger:          logger,
 		subscribingLock: sync.RWMutex{},
+		closeCh:         make(chan struct{}),
 	}
 }
 
 // Init parses metadata and creates a new Pub Sub client.
-func (m *mqttPubSub) Init(metadata pubsub.Metadata) error {
+func (m *mqttPubSub) Init(ctx context.Context, metadata pubsub.Metadata) error {
 	mqttMeta, err := parseMQTTMetaData(metadata, m.logger)
 	if err != nil {
 		return err
 	}
 	m.metadata = mqttMeta
-
-	m.ctx, m.cancel = context.WithCancel(context.Background())
 
 	// mqtt broker allows only one connection at a given time from a clientID.
 	producerClientID := m.metadata.producerID
@@ -78,9 +76,9 @@ func (m *mqttPubSub) Init(metadata pubsub.Metadata) error {
 		// for backwards-compatibility; see: https://github.com/dapr/components-contrib/pull/2104
 		producerClientID = m.metadata.consumerID + "-producer"
 	}
-	connCtx, connCancel := context.WithTimeout(m.ctx, defaultWait)
-	p, err := m.connect(connCtx, producerClientID)
-	connCancel()
+	ctx, cancel := context.WithTimeout(ctx, defaultWait)
+	defer cancel()
+	p, err := m.connect(ctx, producerClientID)
 	if err != nil {
 		return err
 	}
@@ -94,7 +92,7 @@ func (m *mqttPubSub) Init(metadata pubsub.Metadata) error {
 }
 
 // Publish the topic to mqtt pub sub.
-func (m *mqttPubSub) Publish(_ context.Context, req *pubsub.PublishRequest) error {
+func (m *mqttPubSub) Publish(ctx context.Context, req *pubsub.PublishRequest) error {
 	if req.Topic == "" {
 		return errors.New("topic name is empty")
 	}
@@ -122,9 +120,9 @@ func (m *mqttPubSub) Publish(_ context.Context, req *pubsub.PublishRequest) erro
 	select {
 	case <-token.Done():
 		// Operation completed
-	case <-m.ctx.Done():
-		// Context canceled
-		return m.ctx.Err()
+	case <-m.closeCh:
+		// Closed
+		return nil
 	case <-t.C:
 		return fmt.Errorf("mqtt timeout while publishing")
 	}
@@ -137,9 +135,12 @@ func (m *mqttPubSub) Publish(_ context.Context, req *pubsub.PublishRequest) erro
 
 // Subscribe to the mqtt pub sub topic.
 func (m *mqttPubSub) Subscribe(ctx context.Context, req pubsub.SubscribeRequest, handler pubsub.Handler) error {
-	if ctxErr := m.ctx.Err(); ctxErr != nil {
-		// If the global context has been canceled, we do not allow more subscriptions
-		return ctxErr
+	select {
+	case <-m.closeCh:
+		// If the global context has been canceled, we do not allow more
+		// subscriptions
+		return context.Canceled
+	default:
 	}
 
 	if req.Topic == "" {
@@ -154,20 +155,21 @@ func (m *mqttPubSub) Subscribe(ctx context.Context, req pubsub.SubscribeRequest,
 
 	// Add the topic then start the subscription
 	m.addTopic(req.Topic, handler)
-	// Use the global context here to maintain the connection
-	m.startSubscription(m.ctx)
+	m.startSubscription(ctx)
 
 	// Listen for context cancelation to remove the subscription
 	go func() {
+		var closed bool
 		select {
 		case <-ctx.Done():
-		case <-m.ctx.Done():
+		case <-m.closeCh:
+			closed = true
 		}
 		m.subscribingLock.Lock()
 		defer m.subscribingLock.Unlock()
 
 		// If this is the last subscription or if the global context is done, close the connection entirely
-		if len(m.topics) <= 1 || m.ctx.Err() != nil {
+		if len(m.topics) <= 1 || closed {
 			m.closeSubscription()
 			delete(m.topics, req.Topic)
 			return
@@ -176,7 +178,7 @@ func (m *mqttPubSub) Subscribe(ctx context.Context, req pubsub.SubscribeRequest,
 		// Reconnect with one less topic
 		m.resetSubscription()
 		delete(m.topics, req.Topic)
-		m.startSubscription(m.ctx)
+		m.startSubscription(ctx)
 	}()
 
 	return nil
@@ -222,7 +224,7 @@ func (m *mqttPubSub) startSubscription(ctx context.Context) error {
 		subscribeTopics,
 		m.onMessage(ctx),
 	)
-	subscribeCtx, subscribeCancel := context.WithTimeout(m.ctx, defaultWait)
+	subscribeCtx, subscribeCancel := context.WithTimeout(ctx, defaultWait)
 	defer subscribeCancel()
 	select {
 	case <-token.Done():
@@ -353,7 +355,7 @@ func (m *mqttPubSub) Close() error {
 	m.subscribingLock.Lock()
 	defer m.subscribingLock.Unlock()
 
-	m.cancel()
+	close(m.closeCh)
 
 	if m.consumer != nil {
 		m.consumer.Disconnect(5)
