@@ -19,6 +19,8 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/cenkalti/backoff/v4"
@@ -39,11 +41,14 @@ type Hazelcast struct {
 	client   hazelcast.Client
 	logger   logger.Logger
 	metadata metadata
+	closed   atomic.Bool
+	closeCh  chan struct{}
+	wg       sync.WaitGroup
 }
 
 // NewHazelcastPubSub returns a new hazelcast pub-sub implementation.
 func NewHazelcastPubSub(logger logger.Logger) pubsub.PubSub {
-	return &Hazelcast{logger: logger}
+	return &Hazelcast{logger: logger, closeCh: make(chan struct{})}
 }
 
 func parseHazelcastMetadata(meta pubsub.Metadata) (metadata, error) {
@@ -88,6 +93,10 @@ func (p *Hazelcast) Init(ctx context.Context, metadata pubsub.Metadata) error {
 }
 
 func (p *Hazelcast) Publish(ctx context.Context, req *pubsub.PublishRequest) error {
+	if p.closed.Load() {
+		return errors.New("pubsub is closed")
+	}
+
 	topic, err := p.client.GetTopic(req.Topic)
 	if err != nil {
 		return fmt.Errorf("hazelcast error: failed to get topic for %s", req.Topic)
@@ -101,6 +110,10 @@ func (p *Hazelcast) Publish(ctx context.Context, req *pubsub.PublishRequest) err
 }
 
 func (p *Hazelcast) Subscribe(subscribeCtx context.Context, req pubsub.SubscribeRequest, handler pubsub.Handler) error {
+	if p.closed.Load() {
+		return errors.New("pubsub is closed")
+	}
+
 	topic, err := p.client.GetTopic(req.Topic)
 	if err != nil {
 		return fmt.Errorf("hazelcast error: failed to get topic for %s", req.Topic)
@@ -117,8 +130,13 @@ func (p *Hazelcast) Subscribe(subscribeCtx context.Context, req pubsub.Subscribe
 	}
 
 	// Wait for context cancelation then remove the listener
+	p.wg.Add(1)
 	go func() {
-		<-subscribeCtx.Done()
+		defer p.wg.Done()
+		select {
+		case <-subscribeCtx.Done():
+		case <-p.closeCh:
+		}
 		topic.RemoveMessageListener(listenerID)
 	}()
 
@@ -126,6 +144,11 @@ func (p *Hazelcast) Subscribe(subscribeCtx context.Context, req pubsub.Subscribe
 }
 
 func (p *Hazelcast) Close() error {
+	defer p.wg.Wait()
+	if p.closed.CompareAndSwap(false, true) {
+		close(p.closeCh)
+	}
+
 	p.client.Shutdown()
 
 	return nil

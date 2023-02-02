@@ -16,6 +16,8 @@ package topics
 import (
 	"context"
 	"errors"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	servicebus "github.com/Azure/azure-sdk-for-go/sdk/messaging/azservicebus"
@@ -39,6 +41,9 @@ type azureServiceBus struct {
 	client   *impl.Client
 	logger   logger.Logger
 	features []pubsub.Feature
+	closed   atomic.Bool
+	closeCh  chan struct{}
+	wg       sync.WaitGroup
 }
 
 // NewAzureServiceBusTopics returns a new pub-sub implementation.
@@ -46,6 +51,7 @@ func NewAzureServiceBusTopics(logger logger.Logger) pubsub.PubSub {
 	return &azureServiceBus{
 		logger:   logger,
 		features: []pubsub.Feature{pubsub.FeatureMessageTTL},
+		closeCh:  make(chan struct{}),
 	}
 }
 
@@ -64,6 +70,10 @@ func (a *azureServiceBus) Init(_ context.Context, metadata pubsub.Metadata) (err
 }
 
 func (a *azureServiceBus) Publish(ctx context.Context, req *pubsub.PublishRequest) error {
+	if a.closed.Load() {
+		return errors.New("pubsub is closed")
+	}
+
 	msg, err := impl.NewASBMessageFromPubsubRequest(req)
 	if err != nil {
 		return err
@@ -126,6 +136,10 @@ func (a *azureServiceBus) Publish(ctx context.Context, req *pubsub.PublishReques
 }
 
 func (a *azureServiceBus) BulkPublish(ctx context.Context, req *pubsub.BulkPublishRequest) (pubsub.BulkPublishResponse, error) {
+	if a.closed.Load() {
+		return pubsub.BulkPublishResponse{}, errors.New("pubsub is closed")
+	}
+
 	// If the request is empty, sender.SendMessageBatch will panic later.
 	// Return an empty response to avoid this.
 	if len(req.Entries) == 0 {
@@ -172,6 +186,10 @@ func (a *azureServiceBus) BulkPublish(ctx context.Context, req *pubsub.BulkPubli
 }
 
 func (a *azureServiceBus) Subscribe(subscribeCtx context.Context, req pubsub.SubscribeRequest, handler pubsub.Handler) error {
+	if a.closed.Load() {
+		return errors.New("pubsub is closed")
+	}
+
 	requireSessions := utils.IsTruthy(req.Metadata[impl.RequireSessionsMetadataKey])
 	sessionIdleTimeout := time.Duration(utils.GetElemOrDefaultFromMap(req.Metadata, impl.SessionIdleTimeoutMetadataKey, impl.DefaultSesssionIdleTimeoutInSec)) * time.Second
 	maxConcurrentSessions := utils.GetElemOrDefaultFromMap(req.Metadata, impl.MaxConcurrentSessionsMetadataKey, impl.DefaultMaxConcurrentSessions)
@@ -209,6 +227,10 @@ func (a *azureServiceBus) Subscribe(subscribeCtx context.Context, req pubsub.Sub
 }
 
 func (a *azureServiceBus) BulkSubscribe(subscribeCtx context.Context, req pubsub.SubscribeRequest, handler pubsub.BulkHandler) error {
+	if a.closed.Load() {
+		return errors.New("pubsub is closed")
+	}
+
 	requireSessions := utils.IsTruthy(req.Metadata[impl.RequireSessionsMetadataKey])
 	sessionIdleTimeout := time.Duration(utils.GetElemOrDefaultFromMap(req.Metadata, impl.SessionIdleTimeoutMetadataKey, impl.DefaultSesssionIdleTimeoutInSec)) * time.Second
 	maxConcurrentSessions := utils.GetElemOrDefaultFromMap(req.Metadata, impl.MaxConcurrentSessionsMetadataKey, impl.DefaultMaxConcurrentSessions)
@@ -248,11 +270,11 @@ func (a *azureServiceBus) BulkSubscribe(subscribeCtx context.Context, req pubsub
 
 // doSubscribe is a helper function that handles the common logic for both Subscribe and BulkSubscribe.
 // The receiveAndBlockFn is a function should invoke a blocking call to receive messages from the topic.
-func (a *azureServiceBus) doSubscribe(subscribeCtx context.Context,
+func (a *azureServiceBus) doSubscribe(parentCtx context.Context,
 	req pubsub.SubscribeRequest, sub *impl.Subscription, receiveAndBlockFn func(impl.Receiver, func()) error, opts impl.SubscribeOptions,
 ) error {
 	// Does nothing if DisableEntityManagement is true
-	err := a.client.EnsureSubscription(subscribeCtx, a.metadata.ConsumerID, req.Topic, opts)
+	err := a.client.EnsureSubscription(parentCtx, a.metadata.ConsumerID, req.Topic, opts)
 	if err != nil {
 		return err
 	}
@@ -268,7 +290,18 @@ func (a *azureServiceBus) doSubscribe(subscribeCtx context.Context,
 		bo.Reset()
 	}
 
+	subscribeCtx, cancel := context.WithCancel(parentCtx)
+	a.wg.Add(2)
 	go func() {
+		defer a.wg.Done()
+		defer cancel()
+		select {
+		case <-subscribeCtx.Done():
+		case <-a.closeCh:
+		}
+	}()
+	go func() {
+		defer a.wg.Done()
 		// Reconnect loop.
 		for {
 			if opts.RequireSessions {
@@ -285,7 +318,12 @@ func (a *azureServiceBus) doSubscribe(subscribeCtx context.Context,
 
 			wait := bo.NextBackOff()
 			a.logger.Warnf("Subscription to topic %s lost connection, attempting to reconnect in %s...", req.Topic, wait)
-			time.Sleep(wait)
+			select {
+			case <-time.After(wait):
+			case <-subscribeCtx.Done():
+				a.logger.Debug("Context canceled; will not reconnect")
+				return
+			}
 		}
 	}()
 
@@ -293,6 +331,10 @@ func (a *azureServiceBus) doSubscribe(subscribeCtx context.Context,
 }
 
 func (a *azureServiceBus) Close() (err error) {
+	defer a.wg.Wait()
+	if a.closed.CompareAndSwap(false, true) {
+		close(a.closeCh)
+	}
 	a.client.CloseAllSenders(a.logger)
 	return nil
 }
@@ -337,7 +379,9 @@ func (a *azureServiceBus) ConnectAndReceive(subscribeCtx context.Context, req pu
 	}()
 
 	// lock renewal loop
+	a.wg.Add(1)
 	go func() {
+		defer a.wg.Done()
 		a.logger.Debugf("Renewing locks for subscription %s for topic %s", a.metadata.ConsumerID, req.Topic)
 		lockErr := sub.RenewLocksBlocking(lockCtx, receiver, impl.LockRenewalOptions{
 			RenewalInSec: a.metadata.LockRenewalInSec,
@@ -407,7 +451,9 @@ func (a *azureServiceBus) ConnectAndReceiveWithSessions(subscribeCtx context.Con
 						return
 					}
 
+					a.wg.Add(1)
 					go func() {
+						defer a.wg.Done()
 						lockCtx, lockCancel := context.WithCancel(subscribeCtx)
 						defer func() {
 							// cancel the lock renewal loop
@@ -425,7 +471,9 @@ func (a *azureServiceBus) ConnectAndReceiveWithSessions(subscribeCtx context.Con
 						}()
 
 						// lock renewal loop
+						a.wg.Add(1)
 						go func() {
+							defer a.wg.Done()
 							a.logger.Debugf("Renewing locks for session %s receiver for subscription %s to topic %s", sessionID, a.metadata.ConsumerID, req.Topic)
 							lockErr := sub.RenewLocksBlocking(lockCtx, receiver, impl.LockRenewalOptions{
 								RenewalInSec: a.metadata.LockRenewalInSec,

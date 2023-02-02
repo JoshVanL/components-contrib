@@ -16,6 +16,8 @@ package queues
 import (
 	"context"
 	"errors"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	servicebus "github.com/Azure/azure-sdk-for-go/sdk/messaging/azservicebus"
@@ -39,6 +41,9 @@ type azureServiceBus struct {
 	client   *impl.Client
 	logger   logger.Logger
 	features []pubsub.Feature
+	closed   atomic.Bool
+	closeCh  chan struct{}
+	wg       sync.WaitGroup
 }
 
 // NewAzureServiceBusQueues returns a new implementation.
@@ -46,6 +51,7 @@ func NewAzureServiceBusQueues(logger logger.Logger) pubsub.PubSub {
 	return &azureServiceBus{
 		logger:   logger,
 		features: []pubsub.Feature{pubsub.FeatureMessageTTL},
+		closeCh:  make(chan struct{}),
 	}
 }
 
@@ -64,6 +70,10 @@ func (a *azureServiceBus) Init(_ context.Context, metadata pubsub.Metadata) (err
 }
 
 func (a *azureServiceBus) Publish(ctx context.Context, req *pubsub.PublishRequest) error {
+	if a.closed.Load() {
+		return errors.New("pubsub is closed")
+	}
+
 	msg, err := impl.NewASBMessageFromPubsubRequest(req)
 	if err != nil {
 		return err
@@ -127,6 +137,10 @@ func (a *azureServiceBus) Publish(ctx context.Context, req *pubsub.PublishReques
 }
 
 func (a *azureServiceBus) BulkPublish(ctx context.Context, req *pubsub.BulkPublishRequest) (pubsub.BulkPublishResponse, error) {
+	if a.closed.Load() {
+		return pubsub.BulkPublishResponse{}, errors.New("pubsub is closed")
+	}
+
 	// If the request is empty, sender.SendMessageBatch will panic later.
 	// Return an empty response to avoid this.
 	if len(req.Entries) == 0 {
@@ -174,6 +188,10 @@ func (a *azureServiceBus) BulkPublish(ctx context.Context, req *pubsub.BulkPubli
 }
 
 func (a *azureServiceBus) Subscribe(subscribeCtx context.Context, req pubsub.SubscribeRequest, handler pubsub.Handler) error {
+	if a.closed.Load() {
+		return errors.New("pubsub is closed")
+	}
+
 	sub := impl.NewSubscription(
 		subscribeCtx, impl.SubsriptionOptions{
 			MaxActiveMessages:     a.metadata.MaxActiveMessages,
@@ -203,6 +221,10 @@ func (a *azureServiceBus) Subscribe(subscribeCtx context.Context, req pubsub.Sub
 }
 
 func (a *azureServiceBus) BulkSubscribe(subscribeCtx context.Context, req pubsub.SubscribeRequest, handler pubsub.BulkHandler) error {
+	if a.closed.Load() {
+		return errors.New("pubsub is closed")
+	}
+
 	maxBulkSubCount := utils.GetIntValOrDefault(req.BulkSubscribeConfig.MaxMessagesCount, defaultMaxBulkSubCount)
 	sub := impl.NewSubscription(
 		subscribeCtx, impl.SubsriptionOptions{
@@ -234,9 +256,20 @@ func (a *azureServiceBus) BulkSubscribe(subscribeCtx context.Context, req pubsub
 
 // doSubscribe is a helper function that handles the common logic for both Subscribe and BulkSubscribe.
 // The receiveAndBlockFn is a function should invoke a blocking call to receive messages from the topic.
-func (a *azureServiceBus) doSubscribe(subscribeCtx context.Context,
+func (a *azureServiceBus) doSubscribe(parentCtx context.Context,
 	req pubsub.SubscribeRequest, sub *impl.Subscription, receiveAndBlockFn func(impl.Receiver, func()) error,
 ) error {
+	subscribeCtx, cancel := context.WithCancel(parentCtx)
+	a.wg.Add(1)
+	go func() {
+		defer a.wg.Done()
+		defer cancel()
+		select {
+		case <-parentCtx.Done():
+		case <-a.closeCh:
+		}
+	}()
+
 	// Does nothing if DisableEntityManagement is true
 	err := a.client.EnsureQueue(subscribeCtx, req.Topic)
 	if err != nil {
@@ -254,7 +287,10 @@ func (a *azureServiceBus) doSubscribe(subscribeCtx context.Context,
 		bo.Reset()
 	}
 
+	a.wg.Add(1)
 	go func() {
+		defer a.wg.Done()
+
 		// Reconnect loop.
 		for {
 			// Blocks until a successful connection (or until context is canceled)
@@ -291,7 +327,12 @@ func (a *azureServiceBus) doSubscribe(subscribeCtx context.Context,
 
 			wait := bo.NextBackOff()
 			a.logger.Warnf("Subscription to topic %s lost connection, attempting to reconnect in %s...", req.Topic, wait)
-			time.Sleep(wait)
+
+			select {
+			case <-time.After(wait):
+			case <-subscribeCtx.Done():
+				return
+			}
 		}
 	}()
 
@@ -299,6 +340,10 @@ func (a *azureServiceBus) doSubscribe(subscribeCtx context.Context,
 }
 
 func (a *azureServiceBus) Close() (err error) {
+	defer a.wg.Wait()
+	if a.closed.CompareAndSwap(false, true) {
+		close(a.closeCh)
+	}
 	a.client.CloseAllSenders(a.logger)
 	return nil
 }
