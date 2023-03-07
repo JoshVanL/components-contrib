@@ -22,6 +22,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -147,6 +148,7 @@ func TestMySQLIntegration(t *testing.T) {
 		t.Parallel()
 
 		tableName := "test_state"
+		metaTableName := "test_dapr_state"
 
 		// Drop the table if it already exists
 		exists, err := tableExists(context.Background(), mys.db, tableName, 10*time.Second)
@@ -157,7 +159,7 @@ func TestMySQLIntegration(t *testing.T) {
 
 		// Create the state table and test for its existence
 		// There should be no error
-		err = mys.ensureStateTable(context.Background(), tableName)
+		err = mys.ensureStateTable(context.Background(), tableName, metaTableName)
 		assert.Nil(t, err)
 
 		// Now create it and make sure there are no errors
@@ -549,6 +551,36 @@ func TestMySQLIntegration(t *testing.T) {
 			deleteItem(t, mys, set.Key, nil)
 		}
 	})
+
+	t.Run("Set with TTL should not return after ttl", func(t *testing.T) {
+		t.Parallel()
+		key := randomKey()
+		value := &fakeItem{Color: "indigo"}
+
+		setItemWithTTL(t, mys, key, value, nil, time.Second)
+
+		_, outputObject := getItem(t, mys, key)
+		assert.Equal(t, value, outputObject)
+
+		<-time.After(time.Second * 2)
+
+		getResponse, outputObject := getItem(t, mys, key)
+		assert.Equal(t, new(fakeItem), outputObject)
+
+		newValue := &fakeItem{Color: "green"}
+		setItemWithTTL(t, mys, key, newValue, getResponse.ETag, time.Second)
+
+		getResponse, outputObject = getItem(t, mys, key)
+		assert.Equal(t, newValue, outputObject)
+
+		setItemWithTTL(t, mys, key, newValue, getResponse.ETag, time.Second*5)
+		<-time.After(time.Second * 2)
+
+		getResponse, outputObject = getItem(t, mys, key)
+		assert.Equal(t, newValue, outputObject)
+
+		deleteItem(t, mys, key, getResponse.ETag)
+	})
 }
 
 // Tests valid bulk sets and deletes.
@@ -657,6 +689,29 @@ func getRowData(t *testing.T, key string) (returnValue string, insertdate sql.Nu
 	assert.Nil(t, err)
 
 	return returnValue, insertdate, updatedate, eTag
+}
+
+func setItemWithTTL(t *testing.T, mys *MySQL, key string, value interface{}, etag *string, ttl time.Duration) {
+	t.Helper()
+
+	setReq := &state.SetRequest{
+		Key:   key,
+		ETag:  etag,
+		Value: value,
+		Metadata: map[string]string{
+			"ttlInSeconds": strconv.FormatInt(int64(ttl.Seconds()), 10),
+		},
+		Options: state.SetStateOption{
+			Concurrency: "",
+			Consistency: "",
+		},
+		ContentType: nil,
+	}
+
+	err := mys.Set(context.Background(), setReq)
+	assert.Nil(t, err)
+	itemExists := storeItemExists(t, key)
+	assert.True(t, itemExists)
 }
 
 // Connects to MySQL using SSL if required.

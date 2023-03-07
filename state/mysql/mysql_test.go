@@ -64,7 +64,7 @@ func TestFinishInitHandlesSchemaExistsError(t *testing.T) {
 	m.mock1.ExpectQuery("SELECT EXISTS").WillReturnError(expectedErr)
 
 	// Act
-	actualErr := m.mySQL.finishInit(context.Background(), m.mySQL.db)
+	actualErr := m.mySQL.ensureTables(context.Background(), m.mySQL.db)
 
 	// Assert
 	assert.NotNil(t, actualErr, "now error returned")
@@ -83,7 +83,7 @@ func TestFinishInitHandlesDatabaseCreateError(t *testing.T) {
 	m.mock1.ExpectExec("CREATE DATABASE").WillReturnError(expectedErr)
 
 	// Act
-	actualErr := m.mySQL.finishInit(context.Background(), m.mySQL.db)
+	actualErr := m.mySQL.ensureTables(context.Background(), m.mySQL.db)
 
 	// Assert
 	assert.NotNil(t, actualErr, "now error returned")
@@ -107,14 +107,14 @@ func TestFinishInitHandlesPingError(t *testing.T) {
 	m.mock2.ExpectPing().WillReturnError(expectedErr)
 
 	// Act
-	actualErr := m.mySQL.finishInit(context.Background(), m.mySQL.db)
+	actualErr := m.mySQL.ensureTables(context.Background(), m.mySQL.db)
 
 	// Assert
 	assert.NotNil(t, actualErr, "now error returned")
 	assert.Equal(t, "pingError", actualErr.Error(), "wrong error")
 }
 
-// Verifies that finishInit can handle an error from its call to
+// Verifies that ensureTables can handle an error from its call to
 // ensureStateTable. The code should not attempt to create the table. Because
 // there is no m.mock1.ExpectExec if the code attempts to execute the create
 // table commnad this test will fail.
@@ -135,7 +135,7 @@ func TestFinishInitHandlesTableExistsError(t *testing.T) {
 	m.mock2.ExpectQuery("SELECT EXISTS").WillReturnError(fmt.Errorf("tableExistsError"))
 
 	// Act
-	err := m.mySQL.finishInit(context.Background(), m.mySQL.db)
+	err := m.mySQL.ensureTables(context.Background(), m.mySQL.db)
 
 	// Assert
 	assert.NotNil(t, err, "no error returned")
@@ -559,7 +559,7 @@ func TestEnsureStateTableHandlesCreateTableError(t *testing.T) {
 	m.mock1.ExpectExec("CREATE TABLE").WillReturnError(fmt.Errorf("CreateTableError"))
 
 	// Act
-	err := m.mySQL.ensureStateTable(context.Background(), "state")
+	err := m.mySQL.ensureStateTable(context.Background(), "state", "dapr_metadata")
 
 	// Assert
 	assert.NotNil(t, err, "no error returned")
@@ -578,9 +578,11 @@ func TestEnsureStateTableCreatesTable(t *testing.T) {
 	rows := sqlmock.NewRows([]string{"exists"}).AddRow(0)
 	m.mock1.ExpectQuery("SELECT EXISTS").WillReturnRows(rows)
 	m.mock1.ExpectExec("CREATE TABLE").WillReturnResult(sqlmock.NewResult(1, 1))
+	m.mock1.ExpectQuery("SELECT EXISTS").WillReturnRows(sqlmock.NewRows([]string{"exists"}).AddRow(0))
+	m.mock1.ExpectExec("CREATE TABLE").WillReturnResult(sqlmock.NewResult(1, 1))
 
 	// Act
-	err := m.mySQL.ensureStateTable(context.Background(), "state")
+	err := m.mySQL.ensureStateTable(context.Background(), "state", "dapr_metadata")
 
 	// Assert
 	assert.Nil(t, err)
@@ -664,15 +666,26 @@ func TestInitInvalidTableName(t *testing.T) {
 	// Arrange
 	t.Parallel()
 	m, _ := mockDatabase(t)
-	metadata := &state.Metadata{
+	md := &state.Metadata{
 		Base: metadata.Base{Properties: map[string]string{keyConnectionString: "", keyTableName: "🙃"}},
 	}
 
 	// Act
-	err := m.mySQL.Init(context.Background(), *metadata)
+	err := m.mySQL.Init(context.Background(), *md)
 
 	// Assert
-	assert.ErrorContains(t, err, "table name '🙃' is not valid")
+	assert.ErrorContains(t, err, `"tableName": '🙃' is not valid`)
+
+	md = &state.Metadata{
+		Base: metadata.Base{Properties: map[string]string{keyConnectionString: "", keyMetadataTableName: "🙃"}},
+	}
+
+	// Act
+	err = m.mySQL.Init(context.Background(), *md)
+
+	// Assert
+	assert.ErrorContains(t, err, `"metadataTableName": '🙃' is not valid`)
+
 }
 
 func TestInitSetsSchemaName(t *testing.T) {
