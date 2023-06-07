@@ -72,6 +72,49 @@ func (c v8Client) DoRead(ctx context.Context, args ...interface{}) (interface{},
 	return c.client.Do(ctx, args...).Result()
 }
 
+func (c v8Client) DoReadWithTTL(ctx context.Context, cmd, key string) (any, *time.Time, error) {
+	if c.readTimeout > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, time.Duration(c.readTimeout))
+		defer cancel()
+	}
+
+	cmds, err := c.client.Pipelined(ctx, func(p v8.Pipeliner) error {
+		p.TTL(ctx, key)
+		p.Do(ctx, cmd, key)
+		return nil
+	})
+	if err != nil {
+		return nil, nil, err
+	}
+
+	if len(cmds) != 2 {
+		return nil, nil, nil
+	}
+
+	// Pre v7 does not have PEXPIRETIME command, so we use PTTL instead and
+	// approximate the expire time.
+	ttl, err := c.client.TTL(ctx, key).Result()
+	if err != nil {
+		return nil, nil, err
+	}
+
+	var exp *time.Time
+	if ttl >= 0 {
+		expT := time.Now().Add(ttl)
+		exp = &expT
+	}
+
+	switch cmd := cmds[1].(type) {
+	case *v8.StringCmd:
+		return cmd.Val(), exp, nil
+	case *v8.SliceCmd:
+		return cmd.Val(), exp, nil
+	default:
+		return nil, nil, nil
+	}
+}
+
 func (c v8Client) ConfigurationSubscribe(ctx context.Context, args *ConfigurationSubscribeArgs) {
 	// enable notify-keyspace-events by redis Set command
 	// only subscribe to generic and string keyspace events
