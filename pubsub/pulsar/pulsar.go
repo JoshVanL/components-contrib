@@ -201,7 +201,7 @@ func (p *Pulsar) Init(ctx context.Context, metadata pubsub.Metadata) error {
 			Audiences:    m.OIDCAudiences,
 		})
 		if err != nil {
-			return fmt.Errorf("could not instantiate oidc token provider: %v", err)
+			return fmt.Errorf("could not instantiate oidc token provider: %w", err)
 		}
 
 		options.Authentication = pulsar.NewAuthenticationTokenFromSupplier(cc.Token)
@@ -211,7 +211,7 @@ func (p *Pulsar) Init(ctx context.Context, metadata pubsub.Metadata) error {
 
 	client, err := pulsar.NewClient(options)
 	if err != nil {
-		return fmt.Errorf("could not instantiate pulsar client: %v", err)
+		return fmt.Errorf("could not instantiate pulsar client: %w", err)
 	}
 
 	// initialize lru cache with size 10
