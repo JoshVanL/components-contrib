@@ -53,6 +53,7 @@ type snsSqs struct {
 	sqsClient           *sqs.SQS
 	stsClient           *sts.STS
 	metadata            *snsSqsMetadata
+	aws                 *awsAuth.AWS
 	logger              logger.Logger
 	id                  string
 	opsTimeout          time.Duration
@@ -145,10 +146,23 @@ func (s *snsSqs) Init(ctx context.Context, metadata pubsub.Metadata) error {
 
 	s.metadata = md
 
-	sess, err := awsAuth.GetClient(md.AccessKey, md.SecretKey, md.SessionToken, md.Region, md.Endpoint)
+	s.aws, err = awsAuth.New(awsAuth.Options{
+		Logger:       s.logger,
+		Properties:   metadata.Properties,
+		Region:       md.Region,
+		Endpoint:     md.Endpoint,
+		AccessKey:    md.AccessKey,
+		SecretKey:    md.SecretKey,
+		SessionToken: md.SessionToken,
+	})
 	if err != nil {
-		return fmt.Errorf("error creating an AWS client: %w", err)
+		return err
 	}
+	sess, err := s.aws.GetClient(ctx)
+	if err != nil {
+		return err
+	}
+
 	// AWS sns,sqs,sts client.
 	s.snsClient = sns.New(sess)
 	s.sqsClient = sqs.New(sess)

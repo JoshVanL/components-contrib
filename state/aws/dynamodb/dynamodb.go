@@ -25,18 +25,17 @@ import (
 
 	"github.com/google/uuid"
 
-	"github.com/dapr/kit/ptr"
-
 	"github.com/aws/aws-sdk-go/service/dynamodb"
 	"github.com/aws/aws-sdk-go/service/dynamodb/dynamodbattribute"
 	"github.com/aws/aws-sdk-go/service/dynamodb/dynamodbiface"
 	jsoniterator "github.com/json-iterator/go"
 
-	awsAuth "github.com/dapr/components-contrib/common/authentication/aws"
+	"github.com/dapr/components-contrib/common/authentication/aws"
 	"github.com/dapr/components-contrib/metadata"
 	"github.com/dapr/components-contrib/state"
 	"github.com/dapr/kit/logger"
 	kitmd "github.com/dapr/kit/metadata"
+	"github.com/dapr/kit/ptr"
 )
 
 // StateStore is a DynamoDB state store.
@@ -44,6 +43,7 @@ type StateStore struct {
 	state.BulkStore
 
 	client           dynamodbiface.DynamoDBAPI
+	logger           logger.Logger
 	table            string
 	ttlAttributeName string
 	partitionKey     string
@@ -68,9 +68,10 @@ const (
 )
 
 // NewDynamoDBStateStore returns a new dynamoDB state store.
-func NewDynamoDBStateStore(_ logger.Logger) state.Store {
+func NewDynamoDBStateStore(logger logger.Logger) state.Store {
 	s := &StateStore{
 		partitionKey: defaultPartitionKeyName,
+		logger:       logger,
 	}
 	s.BulkStore = state.NewDefaultBulkStore(s)
 	return s
@@ -85,10 +86,25 @@ func (d *StateStore) Init(ctx context.Context, metadata state.Metadata) error {
 
 	// We have this check because we need to set the client to  a mock in tests
 	if d.client == nil {
-		d.client, err = d.getClient(meta)
+		aws, err := aws.New(aws.Options{
+			Logger:       d.logger,
+			Properties:   metadata.Properties,
+			Region:       meta.Region,
+			Endpoint:     meta.Endpoint,
+			AccessKey:    meta.AccessKey,
+			SecretKey:    meta.SecretKey,
+			SessionToken: meta.SessionToken,
+		})
 		if err != nil {
 			return err
 		}
+
+		sess, err := aws.GetClient(ctx)
+		if err != nil {
+			return err
+		}
+
+		d.client = dynamodb.New(sess)
 	}
 	d.table = meta.Table
 	d.ttlAttributeName = meta.TTLAttributeName
@@ -288,16 +304,6 @@ func (d *StateStore) getDynamoDBMetadata(meta state.Metadata) (*dynamoDBMetadata
 	}
 	m.PartitionKey = populatePartitionMetadata(meta.Properties, defaultPartitionKeyName)
 	return &m, err
-}
-
-func (d *StateStore) getClient(metadata *dynamoDBMetadata) (*dynamodb.DynamoDB, error) {
-	sess, err := awsAuth.GetClient(metadata.AccessKey, metadata.SecretKey, metadata.SessionToken, metadata.Region, metadata.Endpoint)
-	if err != nil {
-		return nil, err
-	}
-	c := dynamodb.New(sess)
-
-	return c, nil
 }
 
 // getItemFromReq converts a dapr state.SetRequest into an dynamodb item

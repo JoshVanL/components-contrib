@@ -22,7 +22,7 @@ import (
 	"github.com/aws/aws-sdk-go/service/secretsmanager"
 	"github.com/aws/aws-sdk-go/service/secretsmanager/secretsmanageriface"
 
-	awsAuth "github.com/dapr/components-contrib/common/authentication/aws"
+	"github.com/dapr/components-contrib/common/authentication/aws"
 	"github.com/dapr/components-contrib/metadata"
 	"github.com/dapr/components-contrib/secretstores"
 	"github.com/dapr/kit/logger"
@@ -53,17 +53,30 @@ type smSecretStore struct {
 }
 
 // Init creates a AWS secret manager client.
-func (s *smSecretStore) Init(_ context.Context, metadata secretstores.Metadata) error {
+func (s *smSecretStore) Init(ctx context.Context, metadata secretstores.Metadata) error {
 	meta, err := s.getSecretManagerMetadata(metadata)
 	if err != nil {
 		return err
 	}
 
-	client, err := s.getClient(meta)
+	aws, err := aws.New(aws.Options{
+		Logger:       s.logger,
+		Properties:   metadata.Properties,
+		Region:       meta.Region,
+		AccessKey:    meta.AccessKey,
+		SecretKey:    meta.SecretKey,
+		SessionToken: meta.SessionToken,
+	})
 	if err != nil {
 		return err
 	}
-	s.client = client
+
+	sess, err := aws.GetClient(ctx)
+	if err != nil {
+		return err
+	}
+
+	s.client = secretsmanager.New(sess)
 
 	return nil
 }
@@ -134,15 +147,6 @@ func (s *smSecretStore) BulkGetSecret(ctx context.Context, req secretstores.Bulk
 	}
 
 	return resp, nil
-}
-
-func (s *smSecretStore) getClient(metadata *SecretManagerMetaData) (*secretsmanager.SecretsManager, error) {
-	sess, err := awsAuth.GetClient(metadata.AccessKey, metadata.SecretKey, metadata.SessionToken, metadata.Region, "")
-	if err != nil {
-		return nil, err
-	}
-
-	return secretsmanager.New(sess), nil
 }
 
 func (s *smSecretStore) getSecretManagerMetadata(spec secretstores.Metadata) (*SecretManagerMetaData, error) {

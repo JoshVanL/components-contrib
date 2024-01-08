@@ -66,10 +66,25 @@ func (a *AWSSQS) Init(ctx context.Context, metadata bindings.Metadata) error {
 		return err
 	}
 
-	client, err := a.getClient(m)
+	awsA, err := awsAuth.New(awsAuth.Options{
+		Logger:       a.logger,
+		Properties:   metadata.Properties,
+		Region:       m.Region,
+		Endpoint:     m.Endpoint,
+		AccessKey:    m.AccessKey,
+		SecretKey:    m.SecretKey,
+		SessionToken: m.SessionToken,
+	})
 	if err != nil {
 		return err
 	}
+
+	sess, err := awsA.GetClient(ctx)
+	if err != nil {
+		return err
+	}
+
+	client := sqs.New(sess)
 
 	queueName := m.QueueName
 	resultURL, err := client.GetQueueUrlWithContext(ctx, &sqs.GetQueueUrlInput{
@@ -175,16 +190,6 @@ func (a *AWSSQS) parseSQSMetadata(meta bindings.Metadata) (*sqsMetadata, error) 
 	}
 
 	return &m, nil
-}
-
-func (a *AWSSQS) getClient(metadata *sqsMetadata) (*sqs.SQS, error) {
-	sess, err := awsAuth.GetClient(metadata.AccessKey, metadata.SecretKey, metadata.SessionToken, metadata.Region, metadata.Endpoint)
-	if err != nil {
-		return nil, err
-	}
-	c := sqs.New(sess)
-
-	return c, nil
 }
 
 // GetComponentMetadata returns the metadata of the component.
