@@ -15,7 +15,6 @@ package redis
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"reflect"
@@ -102,17 +101,7 @@ func (r *redisStreams) Publish(ctx context.Context, req *pubsub.PublishRequest) 
 		return errors.New("component is closed")
 	}
 
-	redisPayload := map[string]interface{}{"data": req.Data}
-
-	if req.Metadata != nil {
-		serializedMetadata, err := json.Marshal(req.Metadata)
-		if err != nil {
-			return err
-		}
-		redisPayload["metadata"] = serializedMetadata
-	}
-
-	_, err := r.client.XAdd(ctx, req.Topic, r.clientSettings.MaxLenApprox, redisPayload)
+	_, err := r.client.XAdd(ctx, req.Topic, r.clientSettings.MaxLenApprox, map[string]interface{}{"data": req.Data})
 	if err != nil {
 		return fmt.Errorf("redis streams: error from publish: %s", err)
 	}
@@ -168,7 +157,7 @@ func (r *redisStreams) Subscribe(ctx context.Context, req pubsub.SubscribeReques
 // pick them up for processing.
 func (r *redisStreams) enqueueMessages(ctx context.Context, stream string, handler pubsub.Handler, msgs []rediscomponent.RedisXMessage) {
 	for _, msg := range msgs {
-		rmsg := r.createRedisMessageWrapper(ctx, stream, handler, msg)
+		rmsg := createRedisMessageWrapper(ctx, stream, handler, msg)
 
 		select {
 		// Might block if the queue is full so we need the ctx.Done below.
@@ -183,7 +172,7 @@ func (r *redisStreams) enqueueMessages(ctx context.Context, stream string, handl
 
 // createRedisMessageWrapper encapsulates the Redis message, message identifier, and handler
 // in `redisMessage` for processing.
-func (r *redisStreams) createRedisMessageWrapper(ctx context.Context, stream string, handler pubsub.Handler, msg rediscomponent.RedisXMessage) redisMessageWrapper {
+func createRedisMessageWrapper(ctx context.Context, stream string, handler pubsub.Handler, msg rediscomponent.RedisXMessage) redisMessageWrapper {
 	var data []byte
 	if dataValue, exists := msg.Values["data"]; exists && dataValue != nil {
 		switch v := dataValue.(type) {
@@ -194,21 +183,11 @@ func (r *redisStreams) createRedisMessageWrapper(ctx context.Context, stream str
 		}
 	}
 
-	var metadata map[string]string
-	if metadataValue, exists := msg.Values["metadata"]; exists && metadataValue != nil {
-		metadataStr := metadataValue.(string)
-		err := json.Unmarshal([]byte(metadataStr), &metadata)
-		if err != nil {
-			r.logger.Warnf("Redis PubSub: Could not extract metadata for Redis message %s: %v", msg.ID, err)
-		}
-	}
-
 	return redisMessageWrapper{
 		ctx: ctx,
 		message: pubsub.NewMessage{
-			Topic:    stream,
-			Data:     data,
-			Metadata: metadata,
+			Topic: stream,
+			Data:  data,
 		},
 		messageID: msg.ID,
 		handler:   handler,
